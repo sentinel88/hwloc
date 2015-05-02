@@ -22,6 +22,132 @@
 
 #include <private/cpuid-x86.h>
 
+#include <sys/types.h>
+#include <dirent.h>
+
+struct hwloc_x86_backend_data_s {
+  char *fakecpuid_path;
+  unsigned fakecpuid_nbprocs;
+};
+
+/***********************************
+ * Management of offline/fake cpuid
+ */
+
+struct fakecpuid {
+  unsigned nr;
+  struct fakecpuid_entry {
+    unsigned inmask; /* which of ine[abcd]x are set on input */
+    unsigned ineax;
+    unsigned inebx;
+    unsigned inecx;
+    unsigned inedx;
+    unsigned outeax;
+    unsigned outebx;
+    unsigned outecx;
+    unsigned outedx;
+  } *entries;
+};
+
+static void
+fakecpuid_free(struct fakecpuid *fakecpuid)
+{
+  if (fakecpuid->nr)
+    free(fakecpuid->entries);
+  free(fakecpuid);
+}
+
+static struct fakecpuid *
+fakecpuid_read(const char *dirpath, unsigned idx)
+{
+  struct fakecpuid *fakecpuid;
+  struct fakecpuid_entry *cur;
+  char *filename;
+  size_t filenamelen = strlen(dirpath) + 15;
+  FILE *file;
+  char line[128];
+  unsigned nr;
+
+  fakecpuid = malloc(sizeof(*fakecpuid));
+  fakecpuid->nr = 0; /* return a fakecpuid that will generate warnings because it contains nothing */
+
+  filename = malloc(filenamelen);
+  snprintf(filename, filenamelen, "%s/pu%u", dirpath, idx);
+  file = fopen(filename, "r");
+  if (!file) {
+    fprintf(stderr, "Could not read fake cpuid file %s\n", filename);
+    free(filename);
+    return fakecpuid;
+  }
+  free(filename);
+
+  nr = 0;
+  while (fgets(line, sizeof(line), file))
+    nr++;
+  fakecpuid->entries = malloc(nr * sizeof(struct fakecpuid_entry));
+
+  fseek(file, 0, SEEK_SET);
+  cur = &fakecpuid->entries[0];
+  nr = 0;
+  while (fgets(line, sizeof(line), file)) {
+    if (*line == '#')
+      continue;
+    if (sscanf(line, "%x %x %x %x %x => %x %x %x %x",
+	      &cur->inmask,
+	      &cur->ineax, &cur->inebx, &cur->inecx, &cur->inedx,
+	      &cur->outeax, &cur->outebx, &cur->outecx, &cur->outedx) == 9) {
+      cur++;
+      nr++;
+    }
+  }
+  fakecpuid->nr = nr;
+  fclose(file);
+  return fakecpuid;
+}
+
+static void
+fakecpuid_find(unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx, struct fakecpuid *fakecpuid)
+{
+  unsigned i;
+
+  for(i=0; i<fakecpuid->nr; i++) {
+    struct fakecpuid_entry *entry = &fakecpuid->entries[i];
+    if ((entry->inmask & 0x1) && *eax != entry->ineax)
+      continue;
+    if ((entry->inmask & 0x2) && *ebx != entry->inebx)
+      continue;
+    if ((entry->inmask & 0x4) && *ecx != entry->inecx)
+      continue;
+    if ((entry->inmask & 0x8) && *edx != entry->inedx)
+      continue;
+    *eax = entry->outeax;
+    *ebx = entry->outebx;
+    *ecx = entry->outecx;
+    *edx = entry->outedx;
+    return;
+  }
+
+  fprintf(stderr, "Couldn't find %x,%x,%x,%x in fake cpuid, returning 0s.\n",
+	  *eax, *ebx, *ecx, *edx);
+  *eax = 0;
+  *ebx = 0;
+  *ecx = 0;
+  *edx = 0;
+}
+
+static void x86_cpuid(unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx, struct fakecpuid *fakecpuid)
+{
+  if (fakecpuid) {
+    fakecpuid_find(eax, ebx, ecx, edx, fakecpuid);
+  } else {
+    hwloc_x86_cpuid(eax, ebx, ecx, edx);
+  }
+}
+
+/*******************************
+ * Core detection routines and structures
+ */
+
 #define has_topoext(features) ((features)[6] & (1 << 22))
 #define has_x2apic(features) ((features)[4] & (1 << 21))
 
@@ -111,7 +237,7 @@ static void fill_amd_cache(struct procinfo *infos, unsigned level, int type, uns
 
 /* Fetch information from the processor itself thanks to cpuid and store it in
  * infos for summarize to analyze them globally */
-static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned highest_ext_cpuid, unsigned *features, enum cpuid_type cpuid_type)
+static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned highest_ext_cpuid, unsigned *features, enum cpuid_type cpuid_type, struct fakecpuid *fakecpuid)
 {
   unsigned eax, ebx, ecx = 0, edx;
   unsigned cachenum;
@@ -133,7 +259,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
 
   /* Get apicid, max_log_proc, packageid, logprocid from cpuid 0x01 */
   eax = 0x01;
-  hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+  x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
   infos->apicid = ebx >> 24;
   if (edx & (1 << 28))
     infos->max_log_proc = 1 << hwloc_flsl(((ebx >> 16) & 0xff) - 1);
@@ -165,7 +291,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
   /* Get cpu vendor string from cpuid 0x00 */
   memset(regs, 0, sizeof(regs));
   regs[0] = 0;
-  hwloc_x86_cpuid(&regs[0], &regs[1], &regs[3], &regs[2]);
+  x86_cpuid(&regs[0], &regs[1], &regs[3], &regs[2], fakecpuid);
   memcpy(infos->cpuvendor, regs+1, 4*3);
   /* infos was calloc'ed, already ends with \0 */
 
@@ -173,13 +299,13 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
   if (highest_ext_cpuid >= 0x80000004) {
     memset(regs, 0, sizeof(regs));
     regs[0] = 0x80000002;
-    hwloc_x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3]);
+    x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3], fakecpuid);
     memcpy(infos->cpumodel, regs, 4*4);
     regs[0] = 0x80000003;
-    hwloc_x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3]);
+    x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3], fakecpuid);
     memcpy(infos->cpumodel + 4*4, regs, 4*4);
     regs[0] = 0x80000004;
-    hwloc_x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3]);
+    x86_cpuid(&regs[0], &regs[1], &regs[2], &regs[3], fakecpuid);
     memcpy(infos->cpumodel + 4*4*2, regs, 4*4);
     /* infos was calloc'ed, already ends with \0 */
   }
@@ -190,7 +316,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
   if (cpuid_type != intel && highest_ext_cpuid >= 0x80000008) {
     unsigned coreidsize;
     eax = 0x80000008;
-    hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+    x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
     coreidsize = (ecx >> 12) & 0xf;
     hwloc_debug("core ID size: %u\n", coreidsize);
     if (!coreidsize) {
@@ -224,7 +350,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
     unsigned apic_id, node_id, nodes_per_proc, unit_id, cores_per_unit;
 
     eax = 0x8000001e;
-    hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+    x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
     infos->apicid = apic_id = eax;
     infos->nodeid = node_id = ecx & 0xff;
     nodes_per_proc = ((ecx >> 8) & 7) + 1;
@@ -239,7 +365,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
       unsigned type;
       eax = 0x8000001d;
       ecx = cachenum;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
       type = eax & 0x1f;
       if (type == 0)
 	break;
@@ -253,7 +379,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
       unsigned type;
       eax = 0x8000001d;
       ecx = cachenum;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
 
       type = eax & 0x1f;
 
@@ -288,13 +414,13 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
      */
     if (cpuid_type != intel && highest_ext_cpuid >= 0x80000005) {
       eax = 0x80000005;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
       fill_amd_cache(infos, 1, 1, ecx); /* L1d */
       fill_amd_cache(infos, 1, 2, edx); /* L1i */
     }
     if (cpuid_type != intel && highest_ext_cpuid >= 0x80000006) {
       eax = 0x80000006;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
       fill_amd_cache(infos, 2, 3, ecx); /* L2u */
       fill_amd_cache(infos, 3, 3, edx); /* L3u */
     }
@@ -308,7 +434,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
       unsigned type;
       eax = 0x04;
       ecx = cachenum;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
 
       type = eax & 0x1f;
 
@@ -336,7 +462,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
       unsigned type;
       eax = 0x04;
       ecx = cachenum;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
 
       type = eax & 0x1f;
 
@@ -372,7 +498,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
     for (level = 0; ; level++) {
       ecx = level;
       eax = 0x0b;
-      hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+      x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
       if (!eax && !ebx)
         break;
     }
@@ -382,7 +508,7 @@ static void look_proc(struct procinfo *infos, unsigned highest_cpuid, unsigned h
       for (level = 0; ; level++) {
 	ecx = level;
 	eax = 0x0b;
-	hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+	x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
 	if (!eax && !ebx)
 	  break;
 	apic_nextshift = eax & 0x1f;
@@ -767,7 +893,8 @@ static int
 look_procs(struct hwloc_topology *topology, unsigned nbprocs, struct procinfo *infos, int fulldiscovery,
 	   unsigned highest_cpuid, unsigned highest_ext_cpuid, unsigned *features, enum cpuid_type cpuid_type,
 	   int (*get_cpubind)(hwloc_topology_t topology, hwloc_cpuset_t set, int flags),
-	   int (*set_cpubind)(hwloc_topology_t topology, hwloc_const_cpuset_t set, int flags))
+	   int (*set_cpubind)(hwloc_topology_t topology, hwloc_const_cpuset_t set, int flags),
+	   const char *fakecpuidpath)
 {
   hwloc_bitmap_t orig_cpuset = hwloc_bitmap_alloc();
   hwloc_bitmap_t set;
@@ -781,13 +908,20 @@ look_procs(struct hwloc_topology *topology, unsigned nbprocs, struct procinfo *i
   set = hwloc_bitmap_alloc();
 
   for (i = 0; i < nbprocs; i++) {
-    hwloc_bitmap_only(set, i);
-    hwloc_debug("binding to CPU%d\n", i);
-    if (set_cpubind(topology, set, HWLOC_CPUBIND_STRICT)) {
-      hwloc_debug("could not bind to CPU%d: %s\n", i, strerror(errno));
-      continue;
+    struct fakecpuid *fakecpuid = NULL;
+    if (fakecpuidpath)
+      fakecpuid = fakecpuid_read(fakecpuidpath, i);
+    if (!fakecpuid) {
+      hwloc_bitmap_only(set, i);
+      hwloc_debug("binding to CPU%d\n", i);
+      if (set_cpubind(topology, set, HWLOC_CPUBIND_STRICT)) {
+	hwloc_debug("could not bind to CPU%d: %s\n", i, strerror(errno));
+	continue;
+      }
     }
-    look_proc(&infos[i], highest_cpuid, highest_ext_cpuid, features, cpuid_type);
+    look_proc(&infos[i], highest_cpuid, highest_ext_cpuid, features, cpuid_type, fakecpuid);
+    if (fakecpuid)
+      fakecpuid_free(fakecpuid);
   }
 
   set_cpubind(topology, orig_cpuset, 0);
@@ -802,21 +936,25 @@ look_procs(struct hwloc_topology *topology, unsigned nbprocs, struct procinfo *i
 #include <sys/param.h>
 #include <sys/cpuset.h>
 typedef cpusetid_t hwloc_x86_os_state_t;
-static void hwloc_x86_os_state_save(hwloc_x86_os_state_t *state)
+static void hwloc_x86_os_state_save(hwloc_x86_os_state_t *state, struct fakecpuid *fakecpuid)
 {
-  /* temporary make all cpus available during discovery */
-  cpuset_getid(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, state);
-  cpuset_setid(CPU_WHICH_PID, -1, 0);
+  if (!fakecpuid) {
+    /* temporary make all cpus available during discovery */
+    cpuset_getid(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, state);
+    cpuset_setid(CPU_WHICH_PID, -1, 0);
+  }
 }
-static void hwloc_x86_os_state_restore(hwloc_x86_os_state_t *state)
+static void hwloc_x86_os_state_restore(hwloc_x86_os_state_t *state, struct fakecpuid *fakecpuid)
 {
-  /* restore initial cpuset */
-  cpuset_setid(CPU_WHICH_PID, -1, *state);
+  if (!fakecpuid) {
+    /* restore initial cpuset */
+    cpuset_setid(CPU_WHICH_PID, -1, *state);
+  }
 }
 #else /* !defined HWLOC_FREEBSD_SYS || !defined HAVE_CPUSET_SETID */
 typedef void * hwloc_x86_os_state_t;
-static void hwloc_x86_os_state_save(hwloc_x86_os_state_t *state __hwloc_attribute_unused) { }
-static void hwloc_x86_os_state_restore(hwloc_x86_os_state_t *state __hwloc_attribute_unused) { }
+static void hwloc_x86_os_state_save(hwloc_x86_os_state_t *state __hwloc_attribute_unused, struct fakecpuid *fakecpuid __hwloc_attribute_unused) { }
+static void hwloc_x86_os_state_restore(hwloc_x86_os_state_t *state __hwloc_attribute_unused, struct fakecpuid *fakecpuid __hwloc_attribute_unused) { }
 #endif /* !defined HWLOC_FREEBSD_SYS || !defined HAVE_CPUSET_SETID */
 
 
@@ -843,7 +981,9 @@ static int fake_set_cpubind(hwloc_topology_t topology __hwloc_attribute_unused,
 }
 
 static
-int hwloc_look_x86(struct hwloc_topology *topology, unsigned nbprocs, int fulldiscovery)
+int hwloc_look_x86(struct hwloc_topology *topology,
+		   struct hwloc_x86_backend_data_s *data,
+		   unsigned nbprocs, int fulldiscovery)
 {
   unsigned eax, ebx, ecx = 0, edx;
   unsigned i;
@@ -859,6 +999,7 @@ int hwloc_look_x86(struct hwloc_topology *topology, unsigned nbprocs, int fulldi
   struct hwloc_topology_membind_support memsupport __hwloc_attribute_unused;
   int (*get_cpubind)(hwloc_topology_t topology, hwloc_cpuset_t set, int flags);
   int (*set_cpubind)(hwloc_topology_t topology, hwloc_const_cpuset_t set, int flags);
+  struct fakecpuid *fakecpuid = NULL;
   int ret = -1;
 
   /* check if binding works */
@@ -879,7 +1020,10 @@ int hwloc_look_x86(struct hwloc_topology *topology, unsigned nbprocs, int fulldi
     set_cpubind = fake_set_cpubind;
   }
 
-  if (!hwloc_have_x86_cpuid())
+  if (data->fakecpuid_path)
+    fakecpuid = fakecpuid_read(data->fakecpuid_path, 0);
+
+  if (!fakecpuid && !hwloc_have_x86_cpuid())
     goto out;
 
   infos = calloc(nbprocs, sizeof(struct procinfo));
@@ -894,7 +1038,7 @@ int hwloc_look_x86(struct hwloc_topology *topology, unsigned nbprocs, int fulldi
   }
 
   eax = 0x00;
-  hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+  x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
   highest_cpuid = eax;
   if (ebx == INTEL_EBX && ecx == INTEL_ECX && edx == INTEL_EDX)
     cpuid_type = intel;
@@ -907,47 +1051,47 @@ int hwloc_look_x86(struct hwloc_topology *topology, unsigned nbprocs, int fulldi
   }
 
   eax = 0x01;
-  hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+  x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
   features[0] = edx;
   features[4] = ecx;
 
   eax = 0x80000000;
-  hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+  x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
   highest_ext_cpuid = eax;
 
   hwloc_debug("highest extended cpuid %x\n", highest_ext_cpuid);
 
   if (highest_cpuid >= 0x7) {
     eax = 0x7;
-    hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+    x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
     features[9] = ebx;
   }
 
   if (cpuid_type != intel && highest_ext_cpuid >= 0x80000001) {
     eax = 0x80000001;
-    hwloc_x86_cpuid(&eax, &ebx, &ecx, &edx);
+    x86_cpuid(&eax, &ebx, &ecx, &edx, fakecpuid);
     features[1] = edx;
     features[6] = ecx;
   }
 
-  hwloc_x86_os_state_save(&os_state);
+  hwloc_x86_os_state_save(&os_state, fakecpuid);
 
   ret = look_procs(topology, nbprocs, infos, fulldiscovery,
 		   highest_cpuid, highest_ext_cpuid, features, cpuid_type,
-		   get_cpubind, set_cpubind);
+		   get_cpubind, set_cpubind, data->fakecpuid_path);
   if (ret >= 0)
     /* success, we're done */
     goto out_with_os_state;
 
   if (nbprocs == 1) {
     /* only one processor, no need to bind */
-    look_proc(&infos[0], highest_cpuid, highest_ext_cpuid, features, cpuid_type);
+    look_proc(&infos[0], highest_cpuid, highest_ext_cpuid, features, cpuid_type, fakecpuid);
     summarize(topology, infos, nbprocs, fulldiscovery);
     ret = fulldiscovery;
   }
 
 out_with_os_state:
-  hwloc_x86_os_state_restore(&os_state);
+  hwloc_x86_os_state_restore(&os_state, fakecpuid);
 
 out_with_infos:
   if (NULL != infos) {
@@ -955,20 +1099,29 @@ out_with_infos:
   }
 
 out:
+  if (fakecpuid)
+    fakecpuid_free(fakecpuid);
   return ret;
 }
 
 static int
 hwloc_x86_discover(struct hwloc_backend *backend)
 {
+  struct hwloc_x86_backend_data_s *data = backend->private_data;
   struct hwloc_topology *topology = backend->topology;
-  unsigned nbprocs = hwloc_fallback_nbprocessors(topology);
+  unsigned nbprocs;
   int alreadypus = 0;
   int ret;
 
-  if (!topology->is_thissystem) {
-    hwloc_debug("%s", "\nno x86 detection (not thissystem)\n");
-    return 0;
+  if (data->fakecpuid_path) {
+    nbprocs = data->fakecpuid_nbprocs;
+  } else {
+    nbprocs = hwloc_fallback_nbprocessors(topology);
+
+    if (!topology->is_thissystem) {
+      hwloc_debug("%s", "\nno x86 detection (not thissystem)\n");
+      return 0;
+    }
   }
 
   if (topology->levels[0][0]->cpuset) {
@@ -980,7 +1133,7 @@ hwloc_x86_discover(struct hwloc_backend *backend)
     }
 
     /* several object types were added, we can't easily complete, just annotate a bit */
-    ret = hwloc_look_x86(topology, nbprocs, 0);
+    ret = hwloc_look_x86(topology, data, nbprocs, 0);
     if (ret)
       hwloc_obj_add_info(topology->levels[0][0], "Backend", "x86");
     return 0;
@@ -990,7 +1143,7 @@ hwloc_x86_discover(struct hwloc_backend *backend)
   }
 
 fulldiscovery:
-  hwloc_look_x86(topology, nbprocs, 1);
+  hwloc_look_x86(topology, data, nbprocs, 1);
   /* if failed, just continue and create PUs */
 
   if (!alreadypus)
@@ -998,17 +1151,29 @@ fulldiscovery:
 
   hwloc_obj_add_info(topology->levels[0][0], "Backend", "x86");
 
+  if (!data->fakecpuid_path) {
 #ifdef HAVE_UNAME
-  hwloc_add_uname_info(topology, NULL); /* we already know is_thissystem() is true */
+    hwloc_add_uname_info(topology, NULL); /* we already know is_thissystem() is true */
 #else
-  /* uname isn't available, manually setup the "Architecture" info */
+    /* uname isn't available, manually setup the "Architecture" info */
 #ifdef HWLOC_X86_64_ARCH
-  hwloc_obj_add_info(topology->levels[0][0], "Architecture", "x86_64");
+    hwloc_obj_add_info(topology->levels[0][0], "Architecture", "x86_64");
 #else
-  hwloc_obj_add_info(topology->levels[0][0], "Architecture", "x86");
+    hwloc_obj_add_info(topology->levels[0][0], "Architecture", "x86");
 #endif
 #endif
+  }
+
   return 1;
+}
+
+static void
+hwloc_x86_backend_disable(struct hwloc_backend *backend)
+{
+  struct hwloc_x86_backend_data_s *data = backend->private_data;
+  if (data->fakecpuid_path)
+    free(data->fakecpuid_path);
+  free(data);
 }
 
 static struct hwloc_backend *
@@ -1018,13 +1183,68 @@ hwloc_x86_component_instantiate(struct hwloc_disc_component *component,
 				const void *_data3 __hwloc_attribute_unused)
 {
   struct hwloc_backend *backend;
+  struct hwloc_x86_backend_data_s *data;
+  const char *fakecpuid_path;
 
   backend = hwloc_backend_alloc(component);
   if (!backend)
-    return NULL;
+    goto out;
+
+  data = malloc(sizeof(*data));
+  if (!data) {
+    errno = ENOMEM;
+    goto out_with_backend;
+  }
+
+  backend->private_data = data;
   backend->flags = HWLOC_BACKEND_FLAG_NEED_LEVELS;
   backend->discover = hwloc_x86_discover;
+  backend->disable = hwloc_x86_backend_disable;
+
+  /* default values */
+  data->fakecpuid_path = NULL;
+
+  fakecpuid_path = getenv("HWLOC_X86_CPUID_PATH");
+  if (fakecpuid_path) {
+    DIR *dir = opendir(fakecpuid_path);
+    if (dir) {
+      hwloc_bitmap_t set = hwloc_bitmap_alloc();
+      struct dirent *dirent;
+      while ((dirent = readdir(dir)) != NULL) {
+	if (!strncmp(dirent->d_name, "pu", 2)) {
+	  char *end;
+	  unsigned long idx = strtoul(dirent->d_name+2, &end, 10);
+	  if (!*end)
+	    hwloc_bitmap_set(set, idx);
+	  else
+	    fprintf(stderr, "Ignoring invalid dirent `%s' in fake cpuid directory `%s'\n",
+		    dirent->d_name, fakecpuid_path);
+	}
+      }
+      closedir(dir);
+
+      if (hwloc_bitmap_iszero(set)) {
+	fprintf(stderr, "Did not find any valid pu%%u entry in fake cpuid directory `%s'\n",
+		fakecpuid_path);
+      } else if (hwloc_bitmap_last(set) != hwloc_bitmap_weight(set) - 1) {
+	/* The x86 backends enforces contigous set of PUs starting at 0 so far */
+	fprintf(stderr, "Found non-contigous pu%%u range in fake cpuid directory `%s'\n",
+		fakecpuid_path);
+      } else {
+	backend->is_thissystem = 0;
+	data->fakecpuid_path = strdup(fakecpuid_path);
+	data->fakecpuid_nbprocs = hwloc_bitmap_weight(set);
+      }
+      hwloc_bitmap_free(set);
+    }
+  }
+
   return backend;
+
+ out_with_backend:
+  free(backend);
+ out:
+  return NULL;
 }
 
 static struct hwloc_disc_component hwloc_x86_disc_component = {
