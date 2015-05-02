@@ -32,7 +32,8 @@ bin_PROGRAMS = \
         hwloc-distrib \
         hwloc-info \
         hwloc-patch \
-        hwloc-ps
+        hwloc-ps \
+        hwloc-gather-x86-cpuid
 
 hwloc_calc_SOURCES = \
         hwloc-calc.h \
@@ -72,7 +73,8 @@ man1_pages = \
         hwloc-distrib.1 \
         hwloc-info.1 \
         hwloc-patch.1 \
-        hwloc-ps.1
+        hwloc-ps.1 \
+        hwloc-gather-x86-cpuid.1
 EXTRA_DIST += $(man1_pages:.1=.1in)
 nodist_man_MANS += $(man1_pages)
 
