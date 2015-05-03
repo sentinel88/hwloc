@@ -26,8 +26,8 @@
 #include <dirent.h>
 
 struct hwloc_x86_backend_data_s {
+  unsigned nbprocs;
   char *fakecpuid_path;
-  unsigned fakecpuid_nbprocs;
 };
 
 /***********************************
@@ -561,9 +561,11 @@ hwloc_x86_add_cpuinfos(hwloc_obj_t obj, struct procinfo *info, int nodup)
 }
 
 /* Analyse information stored in infos, and build/annotate topology levels accordingly */
-static void summarize(hwloc_topology_t topology, struct procinfo *infos, unsigned nbprocs,
-		      int fulldiscovery)
+static void summarize(struct hwloc_backend *backend, struct procinfo *infos, int fulldiscovery)
 {
+  struct hwloc_topology *topology = backend->topology;
+  struct hwloc_x86_backend_data_s *data = backend->private_data;
+  unsigned nbprocs = data->nbprocs;
   hwloc_bitmap_t complete_cpuset = hwloc_bitmap_alloc();
   unsigned i, j, l, level, type;
   unsigned nbpackages = 0;
@@ -929,7 +931,7 @@ look_procs(struct hwloc_backend *backend, unsigned nbprocs, struct procinfo *inf
   hwloc_bitmap_free(set);
   hwloc_bitmap_free(orig_cpuset);
 
-  summarize(topology, infos, nbprocs, fulldiscovery);
+  summarize(backend, infos, fulldiscovery);
   return fulldiscovery; /* success, but objects added only if fulldiscovery */
 }
 
@@ -983,10 +985,10 @@ static int fake_set_cpubind(hwloc_topology_t topology __hwloc_attribute_unused,
 
 static
 int hwloc_look_x86(struct hwloc_backend *backend,
-		   unsigned nbprocs, int fulldiscovery)
+		   int fulldiscovery)
 {
   struct hwloc_x86_backend_data_s *data = backend->private_data;
-  struct hwloc_topology *topology = backend->topology;
+  unsigned nbprocs = data->nbprocs;
   unsigned eax, ebx, ecx = 0, edx;
   unsigned i;
   unsigned highest_cpuid;
@@ -1088,7 +1090,7 @@ int hwloc_look_x86(struct hwloc_backend *backend,
   if (nbprocs == 1) {
     /* only one processor, no need to bind */
     look_proc(&infos[0], highest_cpuid, highest_ext_cpuid, features, cpuid_type, fakecpuid);
-    summarize(topology, infos, nbprocs, fulldiscovery);
+    summarize(backend, infos, fulldiscovery);
     ret = fulldiscovery;
   }
 
@@ -1111,14 +1113,11 @@ hwloc_x86_discover(struct hwloc_backend *backend)
 {
   struct hwloc_x86_backend_data_s *data = backend->private_data;
   struct hwloc_topology *topology = backend->topology;
-  unsigned nbprocs;
   int alreadypus = 0;
   int ret;
 
-  if (data->fakecpuid_path) {
-    nbprocs = data->fakecpuid_nbprocs;
-  } else {
-    nbprocs = hwloc_fallback_nbprocessors(topology);
+  if (!data->fakecpuid_path) {
+    data->nbprocs = hwloc_fallback_nbprocessors(topology);
 
     if (!topology->is_thissystem) {
       hwloc_debug("%s", "\nno x86 detection (not thissystem)\n");
@@ -1128,14 +1127,14 @@ hwloc_x86_discover(struct hwloc_backend *backend)
 
   if (topology->levels[0][0]->cpuset) {
     /* somebody else discovered things */
-    if (topology->nb_levels == 2 && topology->level_nbobjects[1] == nbprocs) {
+    if (topology->nb_levels == 2 && topology->level_nbobjects[1] == data->nbprocs) {
       /* only PUs were discovered, as much as we would, complete the topology with everything else */
       alreadypus = 1;
       goto fulldiscovery;
     }
 
     /* several object types were added, we can't easily complete, just annotate a bit */
-    ret = hwloc_look_x86(backend, nbprocs, 0);
+    ret = hwloc_look_x86(backend, 0);
     if (ret)
       hwloc_obj_add_info(topology->levels[0][0], "Backend", "x86");
     return 0;
@@ -1145,11 +1144,11 @@ hwloc_x86_discover(struct hwloc_backend *backend)
   }
 
 fulldiscovery:
-  hwloc_look_x86(backend, nbprocs, 1);
+  hwloc_look_x86(backend, 1);
   /* if failed, just continue and create PUs */
 
   if (!alreadypus)
-    hwloc_setup_pu_level(topology, nbprocs);
+    hwloc_setup_pu_level(topology, data->nbprocs);
 
   hwloc_obj_add_info(topology->levels[0][0], "Backend", "x86");
 
@@ -1235,7 +1234,7 @@ hwloc_x86_component_instantiate(struct hwloc_disc_component *component,
       } else {
 	backend->is_thissystem = 0;
 	data->fakecpuid_path = strdup(fakecpuid_path);
-	data->fakecpuid_nbprocs = hwloc_bitmap_weight(set);
+	data->nbprocs = hwloc_bitmap_weight(set);
       }
       hwloc_bitmap_free(set);
     }
