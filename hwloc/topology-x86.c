@@ -890,12 +890,13 @@ static void summarize(hwloc_topology_t topology, struct procinfo *infos, unsigne
 }
 
 static int
-look_procs(struct hwloc_topology *topology, unsigned nbprocs, struct procinfo *infos, int fulldiscovery,
+look_procs(struct hwloc_backend *backend, unsigned nbprocs, struct procinfo *infos, int fulldiscovery,
 	   unsigned highest_cpuid, unsigned highest_ext_cpuid, unsigned *features, enum cpuid_type cpuid_type,
 	   int (*get_cpubind)(hwloc_topology_t topology, hwloc_cpuset_t set, int flags),
-	   int (*set_cpubind)(hwloc_topology_t topology, hwloc_const_cpuset_t set, int flags),
-	   const char *fakecpuidpath)
+	   int (*set_cpubind)(hwloc_topology_t topology, hwloc_const_cpuset_t set, int flags))
 {
+  struct hwloc_x86_backend_data_s *data = backend->private_data;
+  struct hwloc_topology *topology = backend->topology;
   hwloc_bitmap_t orig_cpuset = hwloc_bitmap_alloc();
   hwloc_bitmap_t set;
   unsigned i;
@@ -909,8 +910,8 @@ look_procs(struct hwloc_topology *topology, unsigned nbprocs, struct procinfo *i
 
   for (i = 0; i < nbprocs; i++) {
     struct fakecpuid *fakecpuid = NULL;
-    if (fakecpuidpath)
-      fakecpuid = fakecpuid_read(fakecpuidpath, i);
+    if (data->fakecpuid_path)
+      fakecpuid = fakecpuid_read(data->fakecpuid_path, i);
     if (!fakecpuid) {
       hwloc_bitmap_only(set, i);
       hwloc_debug("binding to CPU%d\n", i);
@@ -981,10 +982,11 @@ static int fake_set_cpubind(hwloc_topology_t topology __hwloc_attribute_unused,
 }
 
 static
-int hwloc_look_x86(struct hwloc_topology *topology,
-		   struct hwloc_x86_backend_data_s *data,
+int hwloc_look_x86(struct hwloc_backend *backend,
 		   unsigned nbprocs, int fulldiscovery)
 {
+  struct hwloc_x86_backend_data_s *data = backend->private_data;
+  struct hwloc_topology *topology = backend->topology;
   unsigned eax, ebx, ecx = 0, edx;
   unsigned i;
   unsigned highest_cpuid;
@@ -1076,9 +1078,9 @@ int hwloc_look_x86(struct hwloc_topology *topology,
 
   hwloc_x86_os_state_save(&os_state, fakecpuid);
 
-  ret = look_procs(topology, nbprocs, infos, fulldiscovery,
+  ret = look_procs(backend, nbprocs, infos, fulldiscovery,
 		   highest_cpuid, highest_ext_cpuid, features, cpuid_type,
-		   get_cpubind, set_cpubind, data->fakecpuid_path);
+		   get_cpubind, set_cpubind);
   if (ret >= 0)
     /* success, we're done */
     goto out_with_os_state;
@@ -1133,7 +1135,7 @@ hwloc_x86_discover(struct hwloc_backend *backend)
     }
 
     /* several object types were added, we can't easily complete, just annotate a bit */
-    ret = hwloc_look_x86(topology, data, nbprocs, 0);
+    ret = hwloc_look_x86(backend, nbprocs, 0);
     if (ret)
       hwloc_obj_add_info(topology->levels[0][0], "Backend", "x86");
     return 0;
@@ -1143,7 +1145,7 @@ hwloc_x86_discover(struct hwloc_backend *backend)
   }
 
 fulldiscovery:
-  hwloc_look_x86(topology, data, nbprocs, 1);
+  hwloc_look_x86(backend, nbprocs, 1);
   /* if failed, just continue and create PUs */
 
   if (!alreadypus)
